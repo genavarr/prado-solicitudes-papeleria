@@ -1,111 +1,137 @@
-// Capa de almacenamiento: guarda todo en localStorage del navegador.
+// Capa de almacenamiento: Firestore compartido en la nube, con sincronización en
+// tiempo real (todos los roles ven los mismos datos, en cualquier dispositivo).
+//
+// Colecciones:
+//   config/settings   (doc único) { claveAdmin, claveCoordinadora, nombreColegio, sections }
+//   config/counters   (doc único) { nextFolio, nextPedidoFolio }
+//   requests          (una por solicitud de maestra)
+//   pedidos           (uno por pedido consolidado enviado a administración)
 //
 // Flujo de datos:
 //   1) Cada maestra crea una "solicitud" (request) por sección/quincena. status: 'pendiente'.
 //   2) La coordinadora revisa y autoriza cada solicitud (puede ajustar cantidades).
 //      status pasa a 'autorizada' y se guarda cantidadAutorizada por artículo.
 //   3) La coordinadora concentra todas las solicitudes autorizadas de la quincena en
-//      UN SOLO "pedido" (order) y lo envía a la administradora. status del pedido: 'enviado'.
+//      UN SOLO "pedido" y lo envía a la administradora. status del pedido: 'enviado'.
 //   4) La administradora prepara todo y lo entrega en bloque a la coordinadora.
 //      status del pedido pasa a 'recibido'.
 //   5) La coordinadora reparte a cada maestra lo correspondiente y genera su recibo
 //      electrónico individual. La solicitud pasa a status 'entregada'.
-//
-// Estructura persistida bajo STORAGE_KEY:
-// { settings, requests: [...], pedidos: [...], nextFolio, nextPedidoFolio }
 
-const STORAGE_KEY = 'papeleria_app_v1';
+let db = { settings: null, requests: [], pedidos: [] };
+const ready = { settings: false, requests: false, pedidos: false };
+const listeners = [];
+let initError = null;
 
-function loadDB() {
-  const raw = localStorage.getItem(STORAGE_KEY);
-  if (!raw) {
-    const initial = { settings: { ...DEFAULT_SETTINGS }, requests: [], pedidos: [], nextFolio: 1, nextPedidoFolio: 1 };
-    saveDB(initial);
-    return initial;
-  }
-  try {
-    const parsed = JSON.parse(raw);
-    if (!parsed.settings) parsed.settings = { ...DEFAULT_SETTINGS };
-    if (!parsed.settings.claveCoordinadora) parsed.settings.claveCoordinadora = DEFAULT_SETTINGS.claveCoordinadora;
-    if (!parsed.requests) parsed.requests = [];
-    if (!parsed.pedidos) parsed.pedidos = [];
-    if (!parsed.nextFolio) parsed.nextFolio = 1;
-    if (!parsed.nextPedidoFolio) parsed.nextPedidoFolio = 1;
-    return parsed;
-  } catch (e) {
-    console.error('Datos corruptos en localStorage, reiniciando.', e);
-    const initial = { settings: { ...DEFAULT_SETTINGS }, requests: [], pedidos: [], nextFolio: 1, nextPedidoFolio: 1 };
-    saveDB(initial);
-    return initial;
-  }
+function onDataChange(cb) { listeners.push(cb); }
+function notify() { listeners.forEach(cb => cb()); }
+function isReady() { return ready.settings && ready.requests && ready.pedidos; }
+function getInitError() { return initError; }
+
+function stripId(obj) {
+  const { id, ...rest } = obj;
+  return rest;
 }
 
-function saveDB(db) {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(db));
+function initApp() {
+  firebase.initializeApp(FIREBASE_CONFIG);
+  const auth = firebase.auth();
+  const fdb = firebase.firestore();
+
+  auth.signInAnonymously().catch(err => {
+    initError = 'No se pudo autenticar con Firebase: ' + err.message +
+      '. Revisa que el proveedor "Anónimo" esté habilitado en Authentication → Método de acceso.';
+    notify();
+  });
+
+  auth.onAuthStateChanged(user => {
+    if (!user) return;
+
+    fdb.doc('config/settings').onSnapshot(snap => {
+      if (snap.exists) {
+        db.settings = snap.data();
+      } else {
+        db.settings = { ...DEFAULT_SETTINGS };
+        fdb.doc('config/settings').set(DEFAULT_SETTINGS).catch(() => {});
+      }
+      ready.settings = true;
+      notify();
+    }, err => { initError = 'Error leyendo ajustes: ' + err.message; notify(); });
+
+    fdb.collection('requests').onSnapshot(snap => {
+      db.requests = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+      ready.requests = true;
+      notify();
+    }, err => { initError = 'Error leyendo solicitudes: ' + err.message; notify(); });
+
+    fdb.collection('pedidos').onSnapshot(snap => {
+      db.pedidos = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+      ready.pedidos = true;
+      notify();
+    }, err => { initError = 'Error leyendo pedidos: ' + err.message; notify(); });
+  });
 }
+
+function fs() { return firebase.firestore(); }
 
 function getSettings() {
-  return loadDB().settings;
+  return db.settings || DEFAULT_SETTINGS;
 }
 
 function saveSettings(settings) {
-  const db = loadDB();
-  db.settings = settings;
-  saveDB(db);
+  fs().doc('config/settings').set(settings);
 }
 
 // ---------- Solicitudes (por maestra / sección / quincena) ----------
 
 function getRequests() {
-  return loadDB().requests;
+  return db.requests;
 }
 
 function getRequest(id) {
-  return getRequests().find(r => r.id === id) || null;
+  return db.requests.find(r => r.id === id) || null;
 }
 
 function saveRequest(request) {
-  const db = loadDB();
-  const idx = db.requests.findIndex(r => r.id === request.id);
-  if (idx >= 0) db.requests[idx] = request; else db.requests.push(request);
-  saveDB(db);
+  fs().collection('requests').doc(request.id).set(stripId(request));
 }
 
 function genId(prefix) {
   return (prefix || 'r') + '_' + Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
 }
 
-function nextFolio() {
-  const db = loadDB();
-  const folio = db.nextFolio || 1;
-  db.nextFolio = folio + 1;
-  saveDB(db);
-  return folio;
+async function nextFolio() {
+  const ref = fs().doc('config/counters');
+  return fs().runTransaction(async tx => {
+    const snap = await tx.get(ref);
+    const current = (snap.exists && snap.data().nextFolio) || 1;
+    tx.set(ref, { nextFolio: current + 1 }, { merge: true });
+    return current;
+  });
 }
 
-function nextPedidoFolio() {
-  const db = loadDB();
-  const folio = db.nextPedidoFolio || 1;
-  db.nextPedidoFolio = folio + 1;
-  saveDB(db);
-  return folio;
+async function nextPedidoFolio() {
+  const ref = fs().doc('config/counters');
+  return fs().runTransaction(async tx => {
+    const snap = await tx.get(ref);
+    const current = (snap.exists && snap.data().nextPedidoFolio) || 1;
+    tx.set(ref, { nextPedidoFolio: current + 1 }, { merge: true });
+    return current;
+  });
 }
 
 // ---------- Pedidos consolidados (coordinadora -> administradora) ----------
 
 function getPedidos() {
-  return loadDB().pedidos;
+  return db.pedidos;
 }
 
 function getPedido(id) {
-  return getPedidos().find(p => p.id === id) || null;
+  return db.pedidos.find(p => p.id === id) || null;
 }
 
 function savePedido(pedido) {
-  const db = loadDB();
-  const idx = db.pedidos.findIndex(p => p.id === pedido.id);
-  if (idx >= 0) db.pedidos[idx] = pedido; else db.pedidos.push(pedido);
-  saveDB(db);
+  fs().collection('pedidos').doc(pedido.id).set(stripId(pedido));
 }
 
 // Solicitudes autorizadas de una quincena que todavía no forman parte de ningún pedido.
@@ -116,18 +142,18 @@ function solicitudesListasParaPedido(quincena) {
 // Concentra en UN SOLO pedido (por quincena) todas las solicitudes autorizadas pendientes
 // de envío. Si ya existe un pedido abierto (status 'enviado') para esa quincena, se le
 // agregan las nuevas solicitudes autorizadas en vez de crear uno nuevo.
-function enviarPedidoConsolidado(quincena, coordinadoraNombre) {
+async function enviarPedidoConsolidado(quincena, coordinadoraNombre) {
   const pendientes = solicitudesListasParaPedido(quincena);
   if (pendientes.length === 0) return null;
 
-  const db = loadDB();
   const now = Date.now();
   let pedido = db.pedidos.find(p => p.quincena === quincena && p.status === 'enviado');
 
   if (!pedido) {
+    const folio = await nextPedidoFolio();
     pedido = {
       id: genId('p'),
-      folio: nextPedidoFolio(),
+      folio,
       quincena,
       requestIds: [],
       status: 'enviado',
@@ -138,15 +164,17 @@ function enviarPedidoConsolidado(quincena, coordinadoraNombre) {
     };
   }
 
+  const batch = fs().batch();
   pendientes.forEach(r => {
     r.pedidoId = pedido.id;
     r.updatedAt = now;
-    saveRequest(r);
+    batch.set(fs().collection('requests').doc(r.id), stripId(r));
     pedido.requestIds.push(r.id);
   });
   pedido.updatedAt = now;
+  batch.set(fs().collection('pedidos').doc(pedido.id), stripId(pedido));
 
-  savePedido(pedido);
+  await batch.commit();
   return pedido;
 }
 
@@ -190,8 +218,8 @@ function listaQuincenasDisponibles() {
 // ---------- Respaldo ----------
 
 function exportarJSON() {
-  const db = loadDB();
-  const blob = new Blob([JSON.stringify(db, null, 2)], { type: 'application/json' });
+  const payload = { settings: db.settings, requests: db.requests, pedidos: db.pedidos };
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   const fecha = new Date().toISOString().slice(0, 10);
@@ -203,35 +231,43 @@ function exportarJSON() {
   URL.revokeObjectURL(url);
 }
 
-function importarJSON(fileContent) {
+// Fusiona un respaldo importado (de la versión anterior con localStorage, o de otro
+// export) hacia Firestore, sin duplicar ni borrar lo existente.
+async function importarJSON(fileContent) {
   const incoming = JSON.parse(fileContent);
-  const db = loadDB();
+  const batch = fs().batch();
+  let agregadas = 0, actualizadas = 0, pedidosAgregados = 0, pedidosActualizados = 0;
 
-  if (incoming.settings) db.settings = { ...db.settings, ...incoming.settings };
+  if (incoming.settings) {
+    batch.set(fs().doc('config/settings'), { ...db.settings, ...incoming.settings }, { merge: true });
+  }
 
-  let agregadas = 0, actualizadas = 0;
   (incoming.requests || []).forEach(incReq => {
-    const idx = db.requests.findIndex(r => r.id === incReq.id);
-    if (idx >= 0) {
-      if ((incReq.updatedAt || 0) > (db.requests[idx].updatedAt || 0)) { db.requests[idx] = incReq; actualizadas++; }
+    const local = getRequest(incReq.id);
+    if (local) {
+      if ((incReq.updatedAt || 0) > (local.updatedAt || 0)) {
+        batch.set(fs().collection('requests').doc(incReq.id), stripId(incReq));
+        actualizadas++;
+      }
     } else {
-      db.requests.push(incReq); agregadas++;
+      batch.set(fs().collection('requests').doc(incReq.id), stripId(incReq));
+      agregadas++;
     }
   });
 
-  let pedidosAgregados = 0, pedidosActualizados = 0;
   (incoming.pedidos || []).forEach(incPed => {
-    const idx = db.pedidos.findIndex(p => p.id === incPed.id);
-    if (idx >= 0) {
-      if ((incPed.updatedAt || 0) > (db.pedidos[idx].updatedAt || 0)) { db.pedidos[idx] = incPed; pedidosActualizados++; }
+    const local = getPedido(incPed.id);
+    if (local) {
+      if ((incPed.updatedAt || 0) > (local.updatedAt || 0)) {
+        batch.set(fs().collection('pedidos').doc(incPed.id), stripId(incPed));
+        pedidosActualizados++;
+      }
     } else {
-      db.pedidos.push(incPed); pedidosAgregados++;
+      batch.set(fs().collection('pedidos').doc(incPed.id), stripId(incPed));
+      pedidosAgregados++;
     }
   });
 
-  if (incoming.nextFolio && incoming.nextFolio > (db.nextFolio || 1)) db.nextFolio = incoming.nextFolio;
-  if (incoming.nextPedidoFolio && incoming.nextPedidoFolio > (db.nextPedidoFolio || 1)) db.nextPedidoFolio = incoming.nextPedidoFolio;
-
-  saveDB(db);
-  return { agregadas, actualizadas, pedidosAgregados, pedidosActualizados, total: db.requests.length };
+  await batch.commit();
+  return { agregadas, actualizadas, pedidosAgregados, pedidosActualizados, total: db.requests.length + agregadas };
 }

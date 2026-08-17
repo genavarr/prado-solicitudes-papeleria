@@ -46,6 +46,22 @@ backBtn.addEventListener('click', () => {
 
 function render() {
   backBtn.classList.toggle('oculto', state.view === 'role');
+
+  if (getInitError()) {
+    appEl.innerHTML = `<div class="tarjeta centro">
+      <h2>No se pudo conectar</h2>
+      <p class="aviso">${escapeHtml(getInitError())}</p>
+    </div>`;
+    return;
+  }
+
+  if (state.view !== 'role' && !isReady()) {
+    appEl.innerHTML = `<div class="tarjeta centro">
+      <p class="ayuda">Cargando datos...</p>
+    </div>`;
+    return;
+  }
+
   switch (state.view) {
     case 'role': return renderRole();
     case 'teacherSetup': return renderTeacherSetup();
@@ -304,8 +320,9 @@ function renderCoordDashboard() {
 
   const btnEnviarPedido = document.getElementById('btnEnviarPedido');
   if (btnEnviarPedido) {
-    btnEnviarPedido.onclick = () => {
-      const pedido = enviarPedidoConsolidado(quincenaSel, state.coordNombre);
+    btnEnviarPedido.onclick = async () => {
+      btnEnviarPedido.disabled = true;
+      const pedido = await enviarPedidoConsolidado(quincenaSel, state.coordNombre);
       if (pedido) {
         alert(`Pedido ${folioPedidoFormateado(pedido.folio)} enviado a administración con ${pedido.requestIds.length} sección(es).`);
         irA('coordDashboard', { coordQuincena: quincenaSel });
@@ -415,7 +432,7 @@ function renderCoordDeliver() {
       <button class="btn grande" id="btnEntregar" style="margin-top:8px;">Confirmar entrega y generar recibo</button>
     </div>`;
 
-  document.getElementById('btnEntregar').onclick = () => {
+  document.getElementById('btnEntregar').onclick = async () => {
     const entregadoPor = document.getElementById('inpEntregadoPor').value.trim();
     const recibidoPor = document.getElementById('inpRecibidoPor').value.trim();
     if (!entregadoPor) { alert('Escribe el nombre de quien entrega.'); return; }
@@ -430,7 +447,7 @@ function renderCoordDeliver() {
     request.updatedAt = request.deliveredAt;
     request.deliveredBy = entregadoPor;
     request.receivedBy = recibidoPor;
-    request.receiptFolio = nextFolio();
+    request.receiptFolio = await nextFolio();
 
     saveRequest(request);
     abrirReciboParaImprimir(request, getSettings().nombreColegio);
@@ -689,17 +706,19 @@ function renderSettings() {
     const file = e.target.files[0];
     if (!file) return;
     const reader = new FileReader();
-    reader.onload = () => {
+    reader.onload = async () => {
       try {
-        const resultado = importarJSON(reader.result);
+        const resultado = await importarJSON(reader.result);
         alert(`Importación completa: ${resultado.agregadas} solicitudes nuevas, ${resultado.actualizadas} actualizadas; ${resultado.pedidosAgregados} pedidos nuevos, ${resultado.pedidosActualizados} actualizados.`);
         render();
       } catch (err) {
-        alert('El archivo no es un respaldo válido.');
+        alert('El archivo no es un respaldo válido: ' + err.message);
       }
     };
     reader.readAsText(file);
   };
 }
 
+onDataChange(render);
+initApp();
 render();

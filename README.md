@@ -43,22 +43,37 @@ Desde el panel de administradora → *Ajustes* puedes cambiar:
 El catálogo de artículos de papelería está definido en [`js/data.js`](js/data.js)
 si necesitas agregar o quitar materiales.
 
-## Importante: dónde viven los datos
+## Dónde viven los datos
 
-Esta app guarda todo en el **almacenamiento local del navegador** (localStorage)
-del equipo donde se usa — no hay servidor ni base de datos compartida. Esto significa:
+Los datos se guardan en **Firebase Firestore** (base de datos en la nube), no en el
+navegador de cada quien. Esto significa que maestras, coordinadora y administradora
+ven los mismos datos en tiempo real, desde cualquier dispositivo (celular, tablet,
+computadora), sin necesidad de exportar/importar nada.
 
-- Si maestras, coordinadora y administradora usan **el mismo equipo/navegador**
-  (por ejemplo, una computadora en la dirección), todo funciona de forma automática
-  y consolidada.
-- Si usan **equipos distintos**, cada uno tendrá sus propios datos por separado.
-  Para consolidarlos, usa *Ajustes → Exportar respaldo (.json)* en cada equipo y
-  luego *Importar respaldo* en el equipo central — la importación fusiona los datos
-  sin duplicar ni borrar lo existente.
-- Se recomienda exportar un respaldo periódicamente (por quincena) por seguridad,
-  ya que borrar el historial/caché del navegador borraría los datos guardados.
+La app se identifica ante Firebase con una sesión anónima automática (sin pedir
+registro a las usuarias) y la configuración pública del proyecto vive en
+[`js/firebase-config.js`](js/firebase-config.js) — esos valores no son secretos,
+la seguridad real la dan las reglas de Firestore.
 
-Si más adelante quieres que todos los equipos vean los mismos datos en tiempo real
-automáticamente (sin exportar/importar), se necesitaría agregar una base de datos
-en la nube (por ejemplo Firebase) — el código está organizado para poder añadir eso
-después sin rehacer la interfaz.
+### Reglas de seguridad de Firestore
+
+En Firebase Console → Firestore Database → pestaña "Reglas":
+
+```
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /{document=**} {
+      allow read, write: if request.auth != null;
+    }
+  }
+}
+```
+
+Esto permite leer/escribir solo a quienes pasaron por la autenticación anónima de
+la app (bloquea accesos directos a la base de datos desde fuera de la app).
+
+### Respaldo
+
+Desde *Ajustes → Exportar respaldo (.json)* puedes descargar una copia de todos los
+datos en cualquier momento, por seguridad.
